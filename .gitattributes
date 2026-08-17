@@ -1,0 +1,15 @@
+# Keep source files stable across Windows, Linux and CI environments.
+* text=auto eol=lf
+
+# Binary assets used by the firmware and bundled sensor library.
+*.pcm binary
+*.fw binary
+*.woff binary
+*.ttf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.bin binary
+*.elf binary
+*.a binary

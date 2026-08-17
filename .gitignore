@@ -1,0 +1,39 @@
+# Local ESP-IDF installation and caches (large, machine-specific)
+/.espressif/
+/.idf-tools/
+/.cache/
+
+# Downloaded archives and incomplete/mirror checkouts
+/*.zip
+/ESP32-S3-RLCD-4.2/
+/ESP32-S3-RLCD-4.2-git-stalled/
+
+# Keep only the ESP-IDF FactoryProgram baseline from the full Waveshare bundle
+/ESP32-S3-RLCD-4.2-Demo/*
+!/ESP32-S3-RLCD-4.2-Demo/02_ESP-IDF/
+/ESP32-S3-RLCD-4.2-Demo/02_ESP-IDF/*
+!/ESP32-S3-RLCD-4.2-Demo/02_ESP-IDF/10_FactoryProgram/
+
+# Reproducible ESP-IDF outputs and downloaded component sources
+**/build/
+**/build-*/
+**/managed_components/
+**/sdkconfig.old
+**/compile_commands.json
+
+# Local editor configuration; shared tasks.json remains tracked
+/.vscode/settings.json
+/.vscode/*.log
+/.idea/
+/.trae/
+
+# Local-only setup note (the portable setup is in README.md)
+/README_开发环境.md
+
+# OS and temporary files
+Thumbs.db
+.DS_Store
+*.tmp
+*.bak
+*.log
+*~
