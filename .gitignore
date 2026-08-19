@@ -2,6 +2,7 @@
 /.espressif/
 /.idf-tools/
 /.cache/
+/tools/font/
 
 # Downloaded archives and incomplete/mirror checkouts
 /*.zip
@@ -20,6 +21,9 @@
 **/managed_components/
 **/sdkconfig.old
 **/compile_commands.json
+
+# Local secrets
+**/wifi_credentials.local.h
 
 # Local editor configuration; shared tasks.json remains tracked
 /.vscode/settings.json

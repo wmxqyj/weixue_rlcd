@@ -32,7 +32,10 @@ height_(height)
     io_config.lcd_cmd_bits = 8;
     io_config.lcd_param_bits = 8;
     io_config.spi_mode = 0;
-    io_config.trans_queue_depth = 10;
+    // The source buffer lives in PSRAM, so the SPI driver creates one internal
+    // DMA bounce buffer per queued color transaction. Keeping a deep queue can
+    // exhaust internal RAM while TLS is active.
+    io_config.trans_queue_depth = 1;
 
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)spihost, &io_config, &io_handle));
 
@@ -219,7 +222,12 @@ void DisplayPort::RLCD_SendData(uint8_t Data) {
 }
 
 void DisplayPort::RLCD_Sendbuffera(uint8_t *Data, int len) {
-    ESP_ERROR_CHECK(esp_lcd_panel_io_tx_color(io_handle, -1, Data, len));
+    const esp_err_t result = esp_lcd_panel_io_tx_color(io_handle, -1, Data, len);
+    if (result == ESP_ERR_NO_MEM) {
+        ESP_LOGW(TAG, "Display frame skipped while internal DMA memory is busy");
+        return;
+    }
+    ESP_ERROR_CHECK_WITHOUT_ABORT(result);
 }
 
 void DisplayPort::Set_ResetIOLevel(uint8_t level) {

@@ -1,254 +1,771 @@
 #include <stdio.h>
-#include <freertos/freeRTOS.h>
+#include <string.h>
+#include <time.h>
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/event_groups.h>
+#include <freertos/task.h>
+
 #include <esp_log.h>
-#include "button_bsp.h"
-#include "user_app.h"
-#include "gui_guider.h"
-#include "i2c_equipment.h"
-#include "i2c_bsp.h"
-#include "sdcard_bsp.h"
-#include "codec_bsp.h"
+
 #include "adc_bsp.h"
+#include "app_services.h"
+#include "button_bsp.h"
 #include "esp_wifi_bsp.h"
-#include "ble_scan_bsp.h"
+#include "gui_guider.h"
+#include "i2c_bsp.h"
+#include "i2c_equipment.h"
+#include "lvgl_bsp.h"
+#include "user_app.h"
 
-static lv_ui init_ui;
-I2cMasterBus I2cbus(14,13,0);
-CustomSDPort *sdcardPort = NULL;
-Shtc3Port *shtc3port = NULL;
-EventGroupHandle_t CodecGroups;
-CodecPort *codecport = NULL;
-static uint8_t *audio_ptr = NULL;
-static bool is_Music = true;
+LV_FONT_DECLARE(lv_font_noto_sans_sc_18)
+LV_FONT_DECLARE(lv_font_noto_sans_sc_13)
 
-void Lvgl_Cont1Task(void *arg) {
-    lv_obj_clear_flag(init_ui.screen_label_1,LV_OBJ_FLAG_HIDDEN); 
-    lv_obj_add_flag(init_ui.screen_label_2, LV_OBJ_FLAG_HIDDEN);
-    vTaskDelay(pdMS_TO_TICKS(1500));
-    lv_obj_clear_flag(init_ui.screen_label_2,LV_OBJ_FLAG_HIDDEN); 
-    lv_obj_add_flag(init_ui.screen_label_1, LV_OBJ_FLAG_HIDDEN);
-    vTaskDelay(pdMS_TO_TICKS(1500));
-    lv_obj_clear_flag(init_ui.screen_cont_2,LV_OBJ_FLAG_HIDDEN); 
-    lv_obj_add_flag(init_ui.screen_cont_1, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(init_ui.screen_cont_3, LV_OBJ_FLAG_HIDDEN);
-    vTaskDelete(NULL); 
+namespace {
+
+constexpr int kDisplayWidth = 400;
+constexpr int kDisplayHeight = 300;
+constexpr int kStatusHeight = 38;
+constexpr int kFooterHeight = 20;
+constexpr int kContentTop = kStatusHeight;
+constexpr int kContentHeight = kDisplayHeight - kStatusHeight - kFooterHeight;
+
+constexpr EventBits_t kButtonSingle = (1U << 0);
+constexpr EventBits_t kButtonDouble = (1U << 1);
+constexpr EventBits_t kButtonLong = (1U << 2);
+constexpr EventBits_t kAllButtonEvents =
+    kButtonSingle | kButtonDouble | kButtonLong;
+
+constexpr TickType_t kUiPollPeriod = pdMS_TO_TICKS(50);
+constexpr TickType_t kRtcUpdatePeriod = pdMS_TO_TICKS(15000);
+constexpr TickType_t kSensorUpdatePeriod = pdMS_TO_TICKS(30000);
+constexpr TickType_t kBatteryUpdatePeriod = pdMS_TO_TICKS(60000);
+constexpr TickType_t kConnectivityUpdatePeriod = pdMS_TO_TICKS(1000);
+constexpr TickType_t kFooterMessagePeriod = pdMS_TO_TICKS(3000);
+
+const char *kTag = "weixue_ui";
+
+enum class PageId : uint8_t {
+    Home = 0,
+    Market,
+    Settings,
+    Count,
+};
+
+struct UiObjects {
+    lv_obj_t *screen = nullptr;
+    lv_obj_t *pages[static_cast<size_t>(PageId::Count)] = {};
+
+    lv_obj_t *status_bar = nullptr;
+    lv_obj_t *status_time = nullptr;
+    lv_obj_t *status_title = nullptr;
+    lv_obj_t *status_wifi = nullptr;
+    lv_obj_t *status_battery = nullptr;
+    lv_obj_t *footer_box = nullptr;
+    lv_obj_t *footer = nullptr;
+
+    lv_obj_t *home_time = nullptr;
+    lv_obj_t *home_date = nullptr;
+    lv_obj_t *home_temperature = nullptr;
+    lv_obj_t *home_humidity = nullptr;
+    lv_obj_t *home_connection = nullptr;
+
+    lv_obj_t *market_names[APP_MARKET_ITEM_COUNT] = {};
+    lv_obj_t *market_codes[APP_MARKET_ITEM_COUNT] = {};
+    lv_obj_t *market_prices[APP_MARKET_ITEM_COUNT] = {};
+    lv_obj_t *market_changes[APP_MARKET_ITEM_COUNT] = {};
+    lv_obj_t *market_charts[APP_MARKET_ITEM_COUNT] = {};
+    lv_chart_series_t *market_series[APP_MARKET_ITEM_COUNT] = {};
+
+    lv_obj_t *settings_wifi = nullptr;
+    lv_obj_t *settings_sd = nullptr;
+    lv_obj_t *settings_web = nullptr;
+    lv_obj_t *settings_refresh = nullptr;
+};
+
+UiObjects s_ui;
+PageId s_current_page = PageId::Home;
+I2cMasterBus s_i2c_bus(14, 13, 0);
+Shtc3Port *s_shtc3 = nullptr;
+
+TickType_t s_footer_restore_at = 0;
+bool s_footer_is_message = false;
+uint32_t s_market_rendered_generation = UINT32_MAX;
+
+const char *PageTitle(PageId page)
+{
+    static const char *const kTitles[] = {
+        "首页", "行情", "设置"
+    };
+    return kTitles[static_cast<size_t>(page)];
 }
 
-void Lvgl_UserTask(void *arg) {
-    uint32_t times = 0;
-    uint32_t adc_time = 0;
-    uint32_t rtc_time = 0;
-    uint32_t shtc3_time = 0;
-    char lvgl_buffer[30] = {""};
-    for(;;) {
-        if(times - adc_time == 10) {
-            adc_time = times;
-            uint8_t level = Adc_GetBatteryLevel();
-            snprintf(lvgl_buffer,30,"%d%%",level);
-            lv_label_set_text(init_ui.screen_label_7, lvgl_buffer);
-        }
-        if(times - rtc_time == 5) {
-            rtc_time = times;
-            rtcTimeStruct_t timerData;
-            Rtc_GetTime(&timerData);
-            snprintf(lvgl_buffer,30,"%02d",timerData.minute);
-            lv_label_set_text(init_ui.screen_label_3, lvgl_buffer);
-            snprintf(lvgl_buffer,30,"%02d",timerData.second);
-            lv_label_set_text(init_ui.screen_label_4, lvgl_buffer);
-        }
-        if(times - shtc3_time == 25)
-        {
-            shtc3_time = times;
-            float rh,temp;
-            shtc3port->Shtc3_ReadTempHumi(&temp,&rh);
-            snprintf(lvgl_buffer,30,"%d%%",(int)rh);
-            lv_label_set_text(init_ui.screen_label_11, lvgl_buffer);
-            snprintf(lvgl_buffer,30,"%d°",(int)temp);
-            lv_label_set_text(init_ui.screen_label_12, lvgl_buffer);
-        }
-        vTaskDelay(pdMS_TO_TICKS(200));
-        times++;
+void SetObjectBox(lv_obj_t *object, int radius = 0)
+{
+    lv_obj_set_style_bg_color(object, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(object, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(object, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_border_width(object, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(object, radius, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(object, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(object, LV_OBJ_FLAG_SCROLLABLE);
+}
+
+lv_obj_t *CreateLabel(lv_obj_t *parent, const char *text,
+                      const lv_font_t *font = &lv_font_noto_sans_sc_18)
+{
+    lv_obj_t *label = lv_label_create(parent);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_color(label, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(label, font, LV_PART_MAIN);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    return label;
+}
+
+lv_obj_t *CreatePage()
+{
+    lv_obj_t *page = lv_obj_create(s_ui.screen);
+    lv_obj_set_pos(page, 0, kContentTop);
+    lv_obj_set_size(page, kDisplayWidth, kContentHeight);
+    lv_obj_set_style_bg_color(page, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(page, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(page, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(page, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(page, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+    return page;
+}
+
+void CreateStatusBar()
+{
+    lv_obj_t *bar = lv_obj_create(s_ui.screen);
+    s_ui.status_bar = bar;
+    lv_obj_set_pos(bar, 0, 0);
+    lv_obj_set_size(bar, kDisplayWidth, kStatusHeight);
+    lv_obj_set_style_bg_color(bar, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(bar, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_border_width(bar, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_side(bar, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+    lv_obj_set_style_radius(bar, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(bar, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_ui.status_time = CreateLabel(bar, "-- -- 周-");
+    lv_obj_set_pos(s_ui.status_time, 4, 8);
+    lv_obj_set_size(s_ui.status_time, 116, 22);
+    lv_obj_set_style_text_align(s_ui.status_time, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+
+    s_ui.status_title = CreateLabel(bar, "首页");
+    lv_obj_set_pos(s_ui.status_title, 120, 7);
+    lv_obj_set_size(s_ui.status_title, 104, 24);
+
+    s_ui.status_wifi = CreateLabel(bar, "无线 --");
+    lv_obj_set_pos(s_ui.status_wifi, 226, 8);
+    lv_obj_set_size(s_ui.status_wifi, 76, 22);
+
+    s_ui.status_battery = CreateLabel(bar, "电量 --%");
+    lv_obj_set_pos(s_ui.status_battery, 302, 8);
+    lv_obj_set_size(s_ui.status_battery, 94, 22);
+    lv_obj_set_style_text_align(s_ui.status_battery, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
+}
+
+void CreateFooter()
+{
+    lv_obj_t *footer_box = lv_obj_create(s_ui.screen);
+    s_ui.footer_box = footer_box;
+    lv_obj_set_pos(footer_box, 0, kDisplayHeight - kFooterHeight);
+    lv_obj_set_size(footer_box, kDisplayWidth, kFooterHeight);
+    lv_obj_set_style_bg_color(footer_box, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(footer_box, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(footer_box, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_border_width(footer_box, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_side(footer_box, LV_BORDER_SIDE_TOP, LV_PART_MAIN);
+    lv_obj_set_style_radius(footer_box, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(footer_box, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(footer_box, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_ui.footer = CreateLabel(footer_box,
+                              "BOOT 上一页 | KEY 下一页 | 长按操作",
+                              &lv_font_noto_sans_sc_13);
+    lv_obj_set_pos(s_ui.footer, 4, 1);
+    lv_obj_set_size(s_ui.footer, 392, 17);
+}
+
+void CreateHomePage()
+{
+    lv_obj_t *page = CreatePage();
+    s_ui.pages[static_cast<size_t>(PageId::Home)] = page;
+
+    s_ui.home_time = CreateLabel(page, "--:--", &lv_font_MISANSMEDIUM_100);
+    lv_obj_set_pos(s_ui.home_time, 6, -8);
+    lv_obj_set_size(s_ui.home_time, 388, 108);
+
+    s_ui.home_date = CreateLabel(page, "时间未同步");
+    lv_obj_set_pos(s_ui.home_date, 10, 96);
+    lv_obj_set_size(s_ui.home_date, 380, 24);
+
+    lv_obj_t *temperature_box = lv_obj_create(page);
+    lv_obj_set_pos(temperature_box, 10, 128);
+    lv_obj_set_size(temperature_box, 185, 72);
+    SetObjectBox(temperature_box, 5);
+    lv_obj_t *temperature_title = CreateLabel(temperature_box, "温度");
+    lv_obj_set_pos(temperature_title, 10, 23);
+    lv_obj_set_size(temperature_title, 55, 20);
+    lv_obj_set_style_text_align(temperature_title, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+    s_ui.home_temperature = CreateLabel(temperature_box, "-- C", &lv_font_MISANSMEDIUM_25);
+    lv_obj_set_pos(s_ui.home_temperature, 65, 19);
+    lv_obj_set_size(s_ui.home_temperature, 108, 36);
+    lv_obj_set_style_text_align(s_ui.home_temperature, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
+
+    lv_obj_t *humidity_box = lv_obj_create(page);
+    lv_obj_set_pos(humidity_box, 205, 128);
+    lv_obj_set_size(humidity_box, 185, 72);
+    SetObjectBox(humidity_box, 5);
+    lv_obj_t *humidity_title = CreateLabel(humidity_box, "湿度");
+    lv_obj_set_pos(humidity_title, 10, 23);
+    lv_obj_set_size(humidity_title, 55, 20);
+    lv_obj_set_style_text_align(humidity_title, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+    s_ui.home_humidity = CreateLabel(humidity_box, "-- %", &lv_font_MISANSMEDIUM_25);
+    lv_obj_set_pos(s_ui.home_humidity, 65, 19);
+    lv_obj_set_size(s_ui.home_humidity, 108, 36);
+    lv_obj_set_style_text_align(s_ui.home_humidity, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
+
+    s_ui.home_connection = CreateLabel(page, "数据等待更新  |  22:00 休眠");
+    lv_obj_set_pos(s_ui.home_connection, 8, 209);
+    lv_obj_set_size(s_ui.home_connection, 384, 20);
+}
+
+void CreateMarketPage()
+{
+    lv_obj_t *page = lv_obj_create(s_ui.screen);
+    lv_obj_set_pos(page, 0, 0);
+    lv_obj_set_size(page, kDisplayWidth, kDisplayHeight);
+    lv_obj_set_style_bg_color(page, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(page, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(page, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(page, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(page, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+    s_ui.pages[static_cast<size_t>(PageId::Market)] = page;
+
+    const char *names[] = {"上证", "科创", "紫金矿业", "大中矿业"};
+    const char *codes[] = {
+        "000001 沪", "000688 沪", "601899 沪", "001203 深"
+    };
+    for (size_t i = 0; i < APP_MARKET_ITEM_COUNT; ++i) {
+        lv_obj_t *row = lv_obj_create(page);
+        lv_obj_set_pos(row, 0, static_cast<int>(i) * 75);
+        lv_obj_set_size(row, 400, 75);
+        SetObjectBox(row, 0);
+        lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+
+        s_ui.market_names[i] = CreateLabel(row, names[i]);
+        lv_label_set_long_mode(s_ui.market_names[i], LV_LABEL_LONG_DOT);
+        lv_obj_set_pos(s_ui.market_names[i], 5, 5);
+        lv_obj_set_size(s_ui.market_names[i], 76, 23);
+        lv_obj_set_style_text_align(s_ui.market_names[i], LV_TEXT_ALIGN_LEFT,
+                                    LV_PART_MAIN);
+
+        s_ui.market_codes[i] =
+            CreateLabel(row, codes[i], &lv_font_noto_sans_sc_13);
+        lv_obj_set_pos(s_ui.market_codes[i], 5, 35);
+        lv_obj_set_size(s_ui.market_codes[i], 78, 18);
+        lv_obj_set_style_text_align(s_ui.market_codes[i], LV_TEXT_ALIGN_LEFT,
+                                    LV_PART_MAIN);
+
+        s_ui.market_prices[i] =
+            CreateLabel(row, "--", &lv_font_MISANSMEDIUM_20);
+        lv_obj_set_pos(s_ui.market_prices[i], 84, 6);
+        lv_obj_set_size(s_ui.market_prices[i], 88, 28);
+        lv_obj_set_style_text_align(s_ui.market_prices[i], LV_TEXT_ALIGN_RIGHT,
+                                    LV_PART_MAIN);
+
+        s_ui.market_changes[i] =
+            CreateLabel(row, "--", &lv_font_MISANSMEDIUM_18);
+        lv_obj_set_pos(s_ui.market_changes[i], 84, 39);
+        lv_obj_set_size(s_ui.market_changes[i], 88, 25);
+        lv_obj_set_style_text_align(s_ui.market_changes[i], LV_TEXT_ALIGN_RIGHT,
+                                    LV_PART_MAIN);
+
+        lv_obj_t *chart = lv_chart_create(row);
+        s_ui.market_charts[i] = chart;
+        lv_obj_set_pos(chart, 180, 6);
+        lv_obj_set_size(chart, 214, 63);
+        lv_obj_set_style_bg_color(chart, lv_color_white(), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(chart, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_border_width(chart, 0, LV_PART_MAIN);
+        lv_obj_set_style_radius(chart, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(chart, 2, LV_PART_MAIN);
+        lv_obj_set_style_line_color(chart, lv_color_black(), LV_PART_MAIN);
+        lv_obj_set_style_line_opa(chart, LV_OPA_30, LV_PART_MAIN);
+        lv_obj_set_style_line_width(chart, 1, LV_PART_MAIN);
+        lv_obj_set_style_line_width(chart, 2, LV_PART_ITEMS);
+        lv_obj_set_style_size(chart, 0, LV_PART_INDICATOR);
+        lv_obj_clear_flag(chart, LV_OBJ_FLAG_SCROLLABLE);
+        lv_chart_set_type(chart, LV_CHART_TYPE_LINE);
+        lv_chart_set_point_count(chart, APP_MARKET_CHART_POINT_COUNT);
+        lv_chart_set_range(chart, LV_CHART_AXIS_PRIMARY_Y, -10, 10);
+        lv_chart_set_div_line_count(chart, 3, 0);
+        s_ui.market_series[i] =
+            lv_chart_add_series(chart, lv_color_black(),
+                                LV_CHART_AXIS_PRIMARY_Y);
+        lv_chart_set_all_value(chart, s_ui.market_series[i],
+                               LV_CHART_POINT_NONE);
     }
 }
 
-void Lvgl_SDcardTask(void *arg) {
-    const char *str_write = "waveshare.com";
-    char str_read[20] = {""};
-    if(0 == sdcardPort->SDPort_GetStatus()) {
-        lv_label_set_text(init_ui.screen_label_6, "No Card");
+void CreateSettingsPage()
+{
+    lv_obj_t *page = CreatePage();
+    s_ui.pages[static_cast<size_t>(PageId::Settings)] = page;
+
+    lv_obj_t *heading = CreateLabel(page, "设备设置");
+    lv_obj_set_pos(heading, 12, 10);
+    lv_obj_set_size(heading, 376, 34);
+
+    lv_obj_t *settings_box = lv_obj_create(page);
+    lv_obj_set_pos(settings_box, 18, 52);
+    lv_obj_set_size(settings_box, 364, 139);
+    SetObjectBox(settings_box, 4);
+
+    lv_obj_t *wifi_title = CreateLabel(settings_box, "无线网络");
+    lv_obj_set_pos(wifi_title, 12, 9);
+    lv_obj_set_size(wifi_title, 75, 22);
+    lv_obj_set_style_text_align(wifi_title, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+    s_ui.settings_wifi = CreateLabel(settings_box, "连接中");
+    lv_obj_set_pos(s_ui.settings_wifi, 95, 9);
+    lv_obj_set_size(s_ui.settings_wifi, 255, 22);
+    lv_obj_set_style_text_align(s_ui.settings_wifi, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
+
+    lv_obj_t *sd_title = CreateLabel(settings_box, "存储卡");
+    lv_obj_set_pos(sd_title, 12, 40);
+    lv_obj_set_size(sd_title, 75, 22);
+    lv_obj_set_style_text_align(sd_title, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+    s_ui.settings_sd = CreateLabel(settings_box, "读取中");
+    lv_obj_set_pos(s_ui.settings_sd, 95, 40);
+    lv_obj_set_size(s_ui.settings_sd, 255, 22);
+    lv_obj_set_style_text_align(s_ui.settings_sd, LV_TEXT_ALIGN_RIGHT,
+                                LV_PART_MAIN);
+
+    lv_obj_t *web_title = CreateLabel(settings_box, "网页配置");
+    lv_obj_set_pos(web_title, 12, 71);
+    lv_obj_set_size(web_title, 90, 22);
+    lv_obj_set_style_text_align(web_title, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+    s_ui.settings_web = CreateLabel(settings_box, "等待网络");
+    lv_label_set_long_mode(s_ui.settings_web, LV_LABEL_LONG_DOT);
+    lv_obj_set_pos(s_ui.settings_web, 105, 71);
+    lv_obj_set_size(s_ui.settings_web, 245, 22);
+    lv_obj_set_style_text_align(s_ui.settings_web, LV_TEXT_ALIGN_RIGHT,
+                                LV_PART_MAIN);
+
+    lv_obj_t *sleep_title = CreateLabel(settings_box, "休眠计划");
+    lv_obj_set_pos(sleep_title, 12, 102);
+    lv_obj_set_size(sleep_title, 90, 22);
+    lv_obj_set_style_text_align(sleep_title, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+    s_ui.settings_refresh = CreateLabel(settings_box, "每日 22:00 至 08:30");
+    lv_obj_set_pos(s_ui.settings_refresh, 105, 102);
+    lv_obj_set_size(s_ui.settings_refresh, 245, 22);
+    lv_obj_set_style_text_align(s_ui.settings_refresh, LV_TEXT_ALIGN_RIGHT,
+                                LV_PART_MAIN);
+}
+
+void RestoreFooterHelp()
+{
+    if (s_current_page == PageId::Market) {
+        lv_label_set_text(s_ui.footer,
+                          "BOOT 上一页 | KEY 下一页 | 双击刷新");
     } else {
-        sdcardPort->SDPort_WriteFile("/sdcard/sdcard.txt",str_write,strlen(str_write));
-        sdcardPort->SDPort_ReadFile("/sdcard/sdcard.txt",(uint8_t *)str_read,NULL);
-        if(!strcmp(str_write,str_read)) {
-            lv_label_set_text(init_ui.screen_label_6, "passed");
+        lv_label_set_text(s_ui.footer,
+                          "BOOT 上一页 | KEY 下一页 | 长按操作");
+    }
+    s_footer_is_message = false;
+}
+
+void ShowFooterMessage(const char *message)
+{
+    lv_label_set_text(s_ui.footer, message);
+    s_footer_restore_at = xTaskGetTickCount() + kFooterMessagePeriod;
+    s_footer_is_message = true;
+}
+
+void ShowPage(PageId page)
+{
+    for (size_t i = 0; i < static_cast<size_t>(PageId::Count); ++i) {
+        if (i == static_cast<size_t>(page)) {
+            lv_obj_clear_flag(s_ui.pages[i], LV_OBJ_FLAG_HIDDEN);
         } else {
-            lv_label_set_text(init_ui.screen_label_6, "failed");
+            lv_obj_add_flag(s_ui.pages[i], LV_OBJ_FLAG_HIDDEN);
         }
     }
-    vTaskDelete(NULL);
-}
-
-void Lvgl_WfifBleScanTask(void *srg) {
-    char send_lvgl[10] = {""};
-    uint8_t ble_scan_count = 0;
-    uint8_t ble_mac[6];
-    EventBits_t even = xEventGroupWaitBits(wifi_even_,0x02,pdTRUE,pdTRUE,pdMS_TO_TICKS(30000)); 
-    espwifi_deinit(); //释放WIFI
-    ble_scan_prepare();
-    ble_stack_init();
-    ble_scan_start();
-    for(;xQueueReceive(ble_queue,ble_mac,3500) == pdTRUE;) {
-        ble_scan_count++;
-        if(ble_scan_count >= 20)
-        break;
-        vTaskDelay(pdMS_TO_TICKS(30));
-    }
-    if(get_bit_data(even,1)) {
-        snprintf(send_lvgl,9,"%d",user_esp_bsp.apNum);
-        lv_label_set_text(init_ui.screen_label_14, send_lvgl);
+    s_current_page = page;
+    const bool market_fullscreen = page == PageId::Market;
+    if (market_fullscreen) {
+        lv_obj_add_flag(s_ui.status_bar, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_ui.footer_box, LV_OBJ_FLAG_HIDDEN);
     } else {
-        lv_label_set_text(init_ui.screen_label_14, "P");
+        lv_obj_clear_flag(s_ui.status_bar, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_ui.footer_box, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(s_ui.status_title, PageTitle(page));
     }
-    snprintf(send_lvgl,10,"%d",ble_scan_count);
-    lv_label_set_text(init_ui.screen_label_13, send_lvgl);
-    ble_stack_deinit();    //释放BLE
-    vTaskDelete(NULL);
+    RestoreFooterHelp();
 }
 
-void BOOT_LoopTask(void *arg) {
-    bool is_cont4en = 0;
-    for(;;) {
-        EventBits_t even = xEventGroupWaitBits(BootButtonGroups,(0x01 | 0x02 | 0x04),pdTRUE,pdFALSE,pdMS_TO_TICKS(2000));
-        if(even & 0x04) {
-            if(0 == is_cont4en) {
-                is_cont4en = 1;
-                lv_obj_clear_flag(init_ui.screen_cont_4,LV_OBJ_FLAG_HIDDEN); 
-                lv_obj_add_flag(init_ui.screen_cont_1, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_add_flag(init_ui.screen_cont_2, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_add_flag(init_ui.screen_cont_3, LV_OBJ_FLAG_HIDDEN);
-            } else {
-                is_cont4en = 0;
-                lv_obj_clear_flag(init_ui.screen_cont_2,LV_OBJ_FLAG_HIDDEN); 
-                lv_obj_add_flag(init_ui.screen_cont_1, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_add_flag(init_ui.screen_cont_4, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_add_flag(init_ui.screen_cont_3, LV_OBJ_FLAG_HIDDEN);
+void MovePage(int delta)
+{
+    const int count = static_cast<int>(PageId::Count);
+    int index = static_cast<int>(s_current_page) + delta;
+    index = (index % count + count) % count;
+    ShowPage(static_cast<PageId>(index));
+}
+
+void RequestRefresh()
+{
+    AppServices_RequestRefresh();
+    ShowFooterMessage("刷新请求已发送");
+}
+
+void OpenCurrentPage()
+{
+    switch (s_current_page) {
+        case PageId::Home:
+            ShowFooterMessage("首页数据正在实时更新");
+            break;
+        case PageId::Market:
+            RequestRefresh();
+            break;
+        case PageId::Settings:
+            AppServices_ToggleWeb();
+            ShowFooterMessage("网页配置开关请求已发送");
+            break;
+        default:
+            break;
+    }
+}
+
+void HandleButtonEvents(EventBits_t boot_events, EventBits_t key_events)
+{
+    if (boot_events & kButtonLong) {
+        ShowPage(PageId::Home);
+        ShowFooterMessage("首页");
+    } else if (boot_events & kButtonDouble) {
+        ShowPage(PageId::Settings);
+        ShowFooterMessage("设备设置");
+    } else if (boot_events & kButtonSingle) {
+        MovePage(-1);
+    }
+
+    if (key_events & kButtonLong) {
+        OpenCurrentPage();
+    } else if (key_events & kButtonDouble) {
+        RequestRefresh();
+    } else if (key_events & kButtonSingle) {
+        MovePage(1);
+    }
+}
+
+bool IsRtcValid(const rtcTimeStruct_t &time)
+{
+    return time.year >= 2020 && time.year <= 2099 &&
+           time.month >= 1 && time.month <= 12 &&
+           time.day >= 1 && time.day <= 31 &&
+           time.hour >= 0 && time.hour <= 23 &&
+           time.minute >= 0 && time.minute <= 59;
+}
+
+void UpdateRtcLabels(const rtcTimeStruct_t &time)
+{
+    if (!IsRtcValid(time)) {
+        lv_label_set_text(s_ui.status_time, "-- -- 周-");
+        lv_label_set_text(s_ui.home_time, "--:--");
+        lv_label_set_text(s_ui.home_date, "时间未同步");
+        return;
+    }
+
+    static const char *const kWeekdays[] = {
+        "日", "一", "二", "三", "四", "五", "六"
+    };
+    struct tm date = {};
+    date.tm_year = time.year - 1900;
+    date.tm_mon = time.month - 1;
+    date.tm_mday = time.day;
+    date.tm_hour = 12;
+    mktime(&date);
+    const int weekday = date.tm_wday >= 0 && date.tm_wday <= 6
+                            ? date.tm_wday
+                            : 0;
+
+    char buffer[48];
+    snprintf(buffer, sizeof(buffer), "%02d-%02d 周%s",
+             time.month, time.day, kWeekdays[weekday]);
+    lv_label_set_text(s_ui.status_time, buffer);
+
+    snprintf(buffer, sizeof(buffer), "%02d:%02d", time.hour, time.minute);
+    lv_label_set_text(s_ui.home_time, buffer);
+
+    snprintf(buffer, sizeof(buffer), "%04d年%02d月%02d日  星期%s",
+             time.year, time.month, time.day, kWeekdays[weekday]);
+    lv_label_set_text(s_ui.home_date, buffer);
+}
+
+void UpdateSensorLabels(float temperature, float humidity, bool valid)
+{
+    if (!valid) {
+        lv_label_set_text(s_ui.home_temperature, "-- C");
+        lv_label_set_text(s_ui.home_humidity, "-- %");
+        return;
+    }
+
+    char buffer[24];
+    snprintf(buffer, sizeof(buffer), "%.1f C", temperature);
+    lv_label_set_text(s_ui.home_temperature, buffer);
+    snprintf(buffer, sizeof(buffer), "%.0f %%", humidity);
+    lv_label_set_text(s_ui.home_humidity, buffer);
+}
+
+void UpdateBatteryLabel(uint8_t battery_level)
+{
+    char buffer[24];
+    snprintf(buffer, sizeof(buffer), "电量 %u%%",
+             static_cast<unsigned>(battery_level));
+    lv_label_set_text(s_ui.status_battery, buffer);
+}
+
+void UpdateMarketChart(size_t index, const AppMarketItem &market)
+{
+    int range = 10;
+    for (size_t point = 0; point < APP_MARKET_CHART_POINT_COUNT; ++point) {
+        const int value = market.intraday[point];
+        if (value != APP_MARKET_POINT_NONE) {
+            const int magnitude = value < 0 ? -value : value;
+            if (magnitude > range) {
+                range = magnitude;
             }
-        } else if(even & 0x01) {
-            xEventGroupSetBits(CodecGroups,0x02);
-        } else if(even & 0x02) {
-            xEventGroupSetBits(CodecGroups,0x01);
         }
     }
+    range = ((range + 9) / 10) * 10;
+    if (range > 30000) {
+        range = 30000;
+    }
+    lv_chart_set_range(s_ui.market_charts[index],
+                       LV_CHART_AXIS_PRIMARY_Y, -range, range);
+    for (size_t point = 0; point < APP_MARKET_CHART_POINT_COUNT; ++point) {
+        const lv_coord_t value = market.intraday_points > 0 &&
+                                 market.intraday[point] !=
+                                     APP_MARKET_POINT_NONE
+                                     ? market.intraday[point]
+                                     : LV_CHART_POINT_NONE;
+        lv_chart_set_value_by_id(s_ui.market_charts[index],
+                                 s_ui.market_series[index], point, value);
+    }
+    lv_chart_refresh(s_ui.market_charts[index]);
 }
 
-void KEY_LoopTask(void *arg) {
-    bool is_cont3en = 0;
-    for(;;) {
-        EventBits_t even = xEventGroupWaitBits(GP18ButtonGroups,(0x01 | 0x02 | 0x04),pdTRUE,pdFALSE,pdMS_TO_TICKS(2000));
-        if(even & 0x01) {
-            is_Music = false;
-        } else if(even & 0x02) {
-            is_Music = true;
-            xEventGroupSetBits(CodecGroups,0x04);
-        } else if(even & 0x04) {
-            if(0 == is_cont3en) {
-                is_cont3en = 1;
-                lv_obj_clear_flag(init_ui.screen_cont_3,LV_OBJ_FLAG_HIDDEN); 
-                lv_obj_add_flag(init_ui.screen_cont_1, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_add_flag(init_ui.screen_cont_2, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_add_flag(init_ui.screen_cont_4, LV_OBJ_FLAG_HIDDEN);
-            } else {
-                is_cont3en = 0;
-                lv_obj_clear_flag(init_ui.screen_cont_2,LV_OBJ_FLAG_HIDDEN); 
-                lv_obj_add_flag(init_ui.screen_cont_1, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_add_flag(init_ui.screen_cont_3, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_add_flag(init_ui.screen_cont_4, LV_OBJ_FLAG_HIDDEN);
+void UpdateConnectivityLabels()
+{
+    const int ap_count = user_esp_bsp.apNum;
+    const bool wifi_connected = user_esp_bsp.connected;
+    char wifi_ip[sizeof(user_esp_bsp._ip)] = {};
+    strlcpy(wifi_ip, user_esp_bsp._ip, sizeof(wifi_ip));
+    const int wifi_rssi = user_esp_bsp.rssi;
+    AppServiceSnapshot services = {};
+    AppServices_GetSnapshot(&services);
+
+    char buffer[160];
+    if (wifi_connected) {
+        snprintf(buffer, sizeof(buffer), "无线 OK");
+    } else if (ap_count > 0) {
+        snprintf(buffer, sizeof(buffer), "无线 ...");
+    } else {
+        snprintf(buffer, sizeof(buffer), "无线 --");
+    }
+    lv_label_set_text(s_ui.status_wifi, buffer);
+
+    const char *last_update = services.last_update[0] != '\0'
+                                  ? services.last_update
+                                  : "等待更新";
+    const char *update_time = strrchr(last_update, ' ');
+    update_time = update_time != nullptr ? update_time + 1 : last_update;
+    if (services.sleep_schedule_enabled) {
+        snprintf(buffer, sizeof(buffer), "数据 %s  |  %02u:%02u 休眠",
+                 update_time,
+                 static_cast<unsigned>(services.sleep_hour),
+                 static_cast<unsigned>(services.sleep_minute));
+    } else {
+        snprintf(buffer, sizeof(buffer), "数据 %s  |  休眠关闭", update_time);
+    }
+    lv_label_set_text(s_ui.home_connection, buffer);
+
+    if (wifi_connected) {
+        snprintf(buffer, sizeof(buffer), "%s  %d dBm", wifi_ip, wifi_rssi);
+    } else if (ap_count > 0) {
+        snprintf(buffer, sizeof(buffer), "连接中，发现 %d 个热点", ap_count);
+    } else {
+        snprintf(buffer, sizeof(buffer), "正在扫描和连接");
+    }
+    lv_label_set_text(s_ui.settings_wifi, buffer);
+
+    if (services.sd_ready) {
+        snprintf(buffer, sizeof(buffer), "正常，可用 %lu MB",
+                 static_cast<unsigned long>(services.sd_free_mb));
+    } else {
+        snprintf(buffer, sizeof(buffer), "未插入或读取失败");
+    }
+    lv_label_set_text(s_ui.settings_sd, buffer);
+
+    if (services.web_running) {
+        lv_label_set_text(s_ui.settings_web, services.web_url);
+    } else {
+        lv_label_set_text(s_ui.settings_web, "长按 KEY 开启");
+    }
+
+    if (s_market_rendered_generation != services.market_generation) {
+        for (size_t i = 0; i < APP_MARKET_ITEM_COUNT; ++i) {
+            if (services.market[i].valid) {
+                lv_label_set_text(s_ui.market_names[i],
+                                  services.market[i].name);
+
+                const char *market = strstr(services.market[i].symbol, ".SS")
+                                         ? "沪"
+                                         : "深";
+                snprintf(buffer, sizeof(buffer), "%.6s %s",
+                         services.market[i].symbol, market);
+                lv_label_set_text(s_ui.market_codes[i], buffer);
+                lv_label_set_text(s_ui.market_prices[i],
+                                  services.market[i].price);
+                lv_label_set_text(s_ui.market_changes[i],
+                                  services.market[i].change);
+                UpdateMarketChart(i, services.market[i]);
             }
         }
+        s_market_rendered_generation = services.market_generation;
+    }
+    if (services.sleep_imminent) {
+        lv_label_set_text(s_ui.settings_refresh, "即将进入深度休眠");
+    } else if (services.sleep_schedule_enabled) {
+        snprintf(buffer, sizeof(buffer), "每日 %02u:%02u 至 %02u:%02u",
+                 static_cast<unsigned>(services.sleep_hour),
+                 static_cast<unsigned>(services.sleep_minute),
+                 static_cast<unsigned>(services.wake_hour),
+                 static_cast<unsigned>(services.wake_minute));
+        lv_label_set_text(s_ui.settings_refresh, buffer);
+    } else {
+        lv_label_set_text(s_ui.settings_refresh, "已关闭");
     }
 }
 
-void Codec_LoopTask(void *arg) {
-    bool is_eco = 0;
-    for(;;) {
-        EventBits_t even = xEventGroupWaitBits(CodecGroups,(0x01 | 0x02 | 0x04),pdTRUE,pdFALSE,pdMS_TO_TICKS(8 * 1000));
-		if(even & 0x01)
-		{
-			lv_label_set_text(init_ui.screen_label_15, "正在录音");
-			lv_label_set_text(init_ui.screen_label_17, "Recording...");
-			codecport->CodecPort_EchoRead(audio_ptr,192 * 1000);
-			lv_label_set_text(init_ui.screen_label_15, "录音完成");
-			lv_label_set_text(init_ui.screen_label_17, "Rec Done");
-            is_eco = 1;
-		}
-		else if(even & 0x02)
-		{
-            if(1 == is_eco) {
-                is_eco = 0;
-                lv_label_set_text(init_ui.screen_label_15, "正在播放");
-			    lv_label_set_text(init_ui.screen_label_17, "Playing...");
-			    codecport->CodecPort_PlayWrite(audio_ptr,192 * 1000);
-			    lv_label_set_text(init_ui.screen_label_15, "播放完成");
-			    lv_label_set_text(init_ui.screen_label_17, "Play Done");
+void UiTask(void *argument)
+{
+    (void)argument;
+    TickType_t last_rtc = 0;
+    TickType_t last_sensor = 0;
+    TickType_t last_battery = 0;
+    TickType_t last_connectivity = 0;
+    bool first_update = true;
+
+    for (;;) {
+        const EventBits_t boot_events = xEventGroupWaitBits(
+            BootButtonGroups, kAllButtonEvents, pdTRUE, pdFALSE, 0);
+        const EventBits_t key_events = xEventGroupWaitBits(
+            GP18ButtonGroups, kAllButtonEvents, pdTRUE, pdFALSE, 0);
+
+        const TickType_t now = xTaskGetTickCount();
+        const bool update_rtc = first_update || (now - last_rtc >= kRtcUpdatePeriod);
+        const bool update_sensor = first_update ||
+                                   (now - last_sensor >= kSensorUpdatePeriod);
+        const bool update_battery = first_update ||
+                                    (now - last_battery >= kBatteryUpdatePeriod);
+        const bool update_connectivity = first_update ||
+            (now - last_connectivity >= kConnectivityUpdatePeriod);
+
+        rtcTimeStruct_t rtc_time = {};
+        float temperature = 0.0f;
+        float humidity = 0.0f;
+        bool sensor_valid = false;
+        uint8_t battery_level = 0;
+
+        if (update_rtc) {
+            Rtc_GetTime(&rtc_time);
+            last_rtc = now;
+        }
+        if (update_sensor && s_shtc3 != nullptr) {
+            sensor_valid =
+                (s_shtc3->Shtc3_ReadTempHumi(&temperature, &humidity) == NO_ERROR);
+            last_sensor = now;
+        }
+        if (update_battery) {
+            battery_level = Adc_GetBatteryLevel();
+            last_battery = now;
+        }
+        if (update_connectivity) {
+            last_connectivity = now;
+        }
+
+        if (Lvgl_lock(1000)) {
+            if (boot_events != 0 || key_events != 0) {
+                HandleButtonEvents(boot_events, key_events);
             }
-		}
-		else if(even & 0x04)
-		{
-			lv_label_set_text(init_ui.screen_label_15, "正在播放音乐");
-			lv_label_set_text(init_ui.screen_label_17, "Play Music");
-			codecport->CodecPort_SetSpeakerVol(90);
-			uint32_t bytes_sizt;
-			size_t bytes_write = 0;
-			uint8_t *data_ptr = codecport->CodecPort_GetPcmData(&bytes_sizt);
-			while (bytes_write < bytes_sizt)
-            {
-                codecport->CodecPort_PlayWrite(data_ptr, 256);
-                data_ptr += 256;
-                bytes_write += 256;
-				if(!is_Music)
-				break;
+            if (update_rtc) {
+                UpdateRtcLabels(rtc_time);
             }
-			codecport->CodecPort_SetSpeakerVol(100);
-			lv_label_set_text(init_ui.screen_label_15, "播放完成");
-			lv_label_set_text(init_ui.screen_label_17, "Play Done");
-		}
-		else
-		{
-			lv_label_set_text(init_ui.screen_label_15, "等待操作");
-			lv_label_set_text(init_ui.screen_label_17, "Idle");
-		}
+            if (update_sensor) {
+                UpdateSensorLabels(temperature, humidity, sensor_valid);
+            }
+            if (update_battery) {
+                UpdateBatteryLabel(battery_level);
+            }
+            if (update_connectivity) {
+                UpdateConnectivityLabels();
+            }
+            if (s_footer_is_message &&
+                static_cast<int32_t>(now - s_footer_restore_at) >= 0) {
+                RestoreFooterHelp();
+            }
+            Lvgl_unlock();
+        }
+
+        first_update = false;
+        vTaskDelay(kUiPollPeriod);
     }
 }
 
-void UserApp_AppInit() {
-    audio_ptr = (uint8_t *)heap_caps_malloc(288 * 1000 * sizeof(uint8_t), MALLOC_CAP_SPIRAM);
-    assert(audio_ptr);
-    sdcardPort = new CustomSDPort("/sdcard");
+}  // namespace
+
+void UserApp_AppInit()
+{
+    ESP_LOGI(kTag, "Initializing buttons, sensors, RTC and WiFi; Bluetooth disabled");
     Adc_PortInit();
     Custom_ButtonInit();
-    Rtc_Setup(&I2cbus,0x51);
-    Rtc_SetTime(2026,1,5,14,30,30);
-    shtc3port = new Shtc3Port(I2cbus);
+    Rtc_Setup(&s_i2c_bus, 0x51);
+    s_shtc3 = new Shtc3Port(s_i2c_bus);
     espwifi_init();
-    CodecGroups = xEventGroupCreate();
-    codecport = new CodecPort(I2cbus,"S3_RLCD_4_2");
-    codecport->CodecPort_SetInfo("es8311 & es7210",1,16000,2,16);
-    codecport->CodecPort_SetSpeakerVol(100);
-    codecport->CodecPort_SetMicGain(35);
+    AppServices_Init();
+
+    // Do not set RTC to a fixed build-time value here. The retained RTC value is
+    // displayed now and will be synchronized from NTP in the networking phase.
 }
 
-void UserApp_UiInit() {
-    setup_ui(&init_ui);
-    lv_label_set_text(init_ui.screen_label_8, "ON");
-    lv_label_set_text(init_ui.screen_label_15, "等待操作");
+void UserApp_UiInit()
+{
+    s_ui.screen = lv_scr_act();
+    lv_obj_clean(s_ui.screen);
+    lv_obj_set_style_bg_color(s_ui.screen, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s_ui.screen, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_clear_flag(s_ui.screen, LV_OBJ_FLAG_SCROLLABLE);
+
+    CreateStatusBar();
+    CreateHomePage();
+    CreateMarketPage();
+    CreateSettingsPage();
+    CreateFooter();
+    ShowPage(PageId::Home);
+
+    ESP_LOGI(kTag, "Three-page UI initialized");
 }
 
-void UserApp_TaskInit() {
-    xTaskCreatePinnedToCore(Lvgl_Cont1Task, "Lvgl_Cont1Task", 4 * 1024, NULL, 2, NULL,1);
-    xTaskCreatePinnedToCore(Lvgl_UserTask, "Lvgl_UserTask", 5 * 1024, NULL, 2, NULL,1);
-    xTaskCreatePinnedToCore(Lvgl_SDcardTask, "Lvgl_SDcardTask", 4 * 1024, NULL, 2, NULL,1);
-    xTaskCreatePinnedToCore(Lvgl_WfifBleScanTask, "Lvgl_WfifBleScanTask", 4 * 1024, NULL, 2, NULL,1);
-    xTaskCreatePinnedToCore(BOOT_LoopTask, "BOOT_LoopTask", 4 * 1024, NULL, 2, NULL,1);
-    xTaskCreatePinnedToCore(KEY_LoopTask, "KEY_LoopTask", 4 * 1024, NULL, 2, NULL,1);
-    xTaskCreatePinnedToCore(Codec_LoopTask, "Codec_LoopTask", 4 * 1024, NULL, 4, NULL,1);
+void UserApp_TaskInit()
+{
+    xTaskCreatePinnedToCore(UiTask, "ui_state_task", 6144, nullptr, 4,
+                            nullptr, 1);
+    AppServices_Start();
 }
