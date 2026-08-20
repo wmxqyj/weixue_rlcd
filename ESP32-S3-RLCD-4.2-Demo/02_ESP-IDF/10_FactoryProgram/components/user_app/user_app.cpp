@@ -36,7 +36,7 @@ constexpr EventBits_t kButtonLong = (1U << 2);
 constexpr EventBits_t kAllButtonEvents =
     kButtonSingle | kButtonDouble | kButtonLong;
 
-constexpr TickType_t kUiPollPeriod = pdMS_TO_TICKS(50);
+constexpr TickType_t kUiPollPeriod = pdMS_TO_TICKS(100);
 constexpr TickType_t kRtcUpdatePeriod = pdMS_TO_TICKS(15000);
 constexpr TickType_t kSensorUpdatePeriod = pdMS_TO_TICKS(30000);
 constexpr TickType_t kBatteryUpdatePeriod = pdMS_TO_TICKS(60000);
@@ -47,7 +47,8 @@ const char *kTag = "weixue_ui";
 
 enum class PageId : uint8_t {
     Home = 0,
-    Market,
+    Market1,
+    Market2,
     Settings,
     Count,
 };
@@ -76,6 +77,7 @@ struct UiObjects {
     lv_obj_t *market_changes[APP_MARKET_ITEM_COUNT] = {};
     lv_obj_t *market_charts[APP_MARKET_ITEM_COUNT] = {};
     lv_chart_series_t *market_series[APP_MARKET_ITEM_COUNT] = {};
+    lv_obj_t *market_benchmarks[APP_MARKET_BENCHMARK_COUNT] = {};
 
     lv_obj_t *settings_wifi = nullptr;
     lv_obj_t *settings_sd = nullptr;
@@ -95,7 +97,7 @@ uint32_t s_market_rendered_generation = UINT32_MAX;
 const char *PageTitle(PageId page)
 {
     static const char *const kTitles[] = {
-        "首页", "行情", "设置"
+        "首页", "行情一", "行情二", "设置"
     };
     return kTitles[static_cast<size_t>(page)];
 }
@@ -186,7 +188,7 @@ void CreateFooter()
     lv_obj_clear_flag(footer_box, LV_OBJ_FLAG_SCROLLABLE);
 
     s_ui.footer = CreateLabel(footer_box,
-                              "BOOT 上一页 | KEY 下一页 | 长按操作",
+                              "KEY 上一页 | BOOT 下一页 | 长按操作",
                               &lv_font_noto_sans_sc_13);
     lv_obj_set_pos(s_ui.footer, 4, 1);
     lv_obj_set_size(s_ui.footer, 392, 17);
@@ -236,7 +238,8 @@ void CreateHomePage()
     lv_obj_set_size(s_ui.home_connection, 384, 20);
 }
 
-void CreateMarketPage()
+void CreateMarketPage(PageId page_id, size_t page_index,
+                      bool show_benchmarks)
 {
     lv_obj_t *page = lv_obj_create(s_ui.screen);
     lv_obj_set_pos(page, 0, 0);
@@ -247,51 +250,76 @@ void CreateMarketPage()
     lv_obj_set_style_radius(page, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(page, 0, LV_PART_MAIN);
     lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLLABLE);
-    s_ui.pages[static_cast<size_t>(PageId::Market)] = page;
+    s_ui.pages[static_cast<size_t>(page_id)] = page;
 
-    const char *names[] = {"上证", "科创", "紫金矿业", "大中矿业"};
-    const char *codes[] = {
-        "000001 沪", "000688 沪", "601899 沪", "001203 深"
-    };
-    for (size_t i = 0; i < APP_MARKET_ITEM_COUNT; ++i) {
+    const int list_top = show_benchmarks ? 30 : 0;
+    if (show_benchmarks) {
+        lv_obj_t *benchmark_bar = lv_obj_create(page);
+        lv_obj_set_pos(benchmark_bar, 0, 0);
+        lv_obj_set_size(benchmark_bar, kDisplayWidth, list_top);
+        SetObjectBox(benchmark_bar, 0);
+        lv_obj_set_style_border_side(benchmark_bar, LV_BORDER_SIDE_BOTTOM,
+                                     LV_PART_MAIN);
+        for (size_t i = 0; i < APP_MARKET_BENCHMARK_COUNT; ++i) {
+            s_ui.market_benchmarks[i] =
+                CreateLabel(benchmark_bar,
+                            i == 0 ? "上证  --" : "科创  --",
+                            &lv_font_noto_sans_sc_18);
+            lv_obj_set_pos(s_ui.market_benchmarks[i],
+                           static_cast<int>(i) * 190 + 8, 1);
+            lv_obj_set_size(s_ui.market_benchmarks[i], 180, 20);
+            lv_obj_set_style_text_align(s_ui.market_benchmarks[i],
+                                        LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        }
+    }
+
+    const int row_height = (kDisplayHeight - list_top) /
+                           static_cast<int>(APP_MARKET_ITEMS_PER_PAGE);
+    const size_t offset = page_index * APP_MARKET_ITEMS_PER_PAGE;
+    for (size_t i = 0; i < APP_MARKET_ITEMS_PER_PAGE; ++i) {
+        const size_t item_index = offset + i;
+        const int row_y = list_top + static_cast<int>(i) * row_height;
+        const int height = i + 1 == APP_MARKET_ITEMS_PER_PAGE
+                               ? kDisplayHeight - row_y
+                               : row_height;
         lv_obj_t *row = lv_obj_create(page);
-        lv_obj_set_pos(row, 0, static_cast<int>(i) * 75);
-        lv_obj_set_size(row, 400, 75);
+        lv_obj_set_pos(row, 0, row_y);
+        lv_obj_set_size(row, kDisplayWidth, height);
         SetObjectBox(row, 0);
         lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
 
-        s_ui.market_names[i] = CreateLabel(row, names[i]);
-        lv_label_set_long_mode(s_ui.market_names[i], LV_LABEL_LONG_DOT);
-        lv_obj_set_pos(s_ui.market_names[i], 5, 5);
-        lv_obj_set_size(s_ui.market_names[i], 76, 23);
-        lv_obj_set_style_text_align(s_ui.market_names[i], LV_TEXT_ALIGN_LEFT,
-                                    LV_PART_MAIN);
+        s_ui.market_names[item_index] = CreateLabel(row, "待配置");
+        lv_label_set_long_mode(s_ui.market_names[item_index], LV_LABEL_LONG_DOT);
+        lv_obj_set_pos(s_ui.market_names[item_index], 5, 4);
+        lv_obj_set_size(s_ui.market_names[item_index], 76, 23);
+        lv_obj_set_style_text_align(s_ui.market_names[item_index],
+                                    LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
 
-        s_ui.market_codes[i] =
-            CreateLabel(row, codes[i], &lv_font_noto_sans_sc_13);
-        lv_obj_set_pos(s_ui.market_codes[i], 5, 35);
-        lv_obj_set_size(s_ui.market_codes[i], 78, 18);
-        lv_obj_set_style_text_align(s_ui.market_codes[i], LV_TEXT_ALIGN_LEFT,
-                                    LV_PART_MAIN);
+        s_ui.market_codes[item_index] =
+            CreateLabel(row, "--", &lv_font_noto_sans_sc_13);
+        lv_obj_set_pos(s_ui.market_codes[item_index], 5, 32);
+        lv_obj_set_size(s_ui.market_codes[item_index], 78, 18);
+        lv_obj_set_style_text_align(s_ui.market_codes[item_index],
+                                    LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
 
-        s_ui.market_prices[i] =
+        s_ui.market_prices[item_index] =
             CreateLabel(row, "--", &lv_font_MISANSMEDIUM_20);
-        lv_obj_set_pos(s_ui.market_prices[i], 84, 6);
-        lv_obj_set_size(s_ui.market_prices[i], 88, 28);
-        lv_obj_set_style_text_align(s_ui.market_prices[i], LV_TEXT_ALIGN_RIGHT,
-                                    LV_PART_MAIN);
+        lv_obj_set_pos(s_ui.market_prices[item_index], 84, 5);
+        lv_obj_set_size(s_ui.market_prices[item_index], 88, 28);
+        lv_obj_set_style_text_align(s_ui.market_prices[item_index],
+                                    LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
 
-        s_ui.market_changes[i] =
+        s_ui.market_changes[item_index] =
             CreateLabel(row, "--", &lv_font_MISANSMEDIUM_18);
-        lv_obj_set_pos(s_ui.market_changes[i], 84, 39);
-        lv_obj_set_size(s_ui.market_changes[i], 88, 25);
-        lv_obj_set_style_text_align(s_ui.market_changes[i], LV_TEXT_ALIGN_RIGHT,
-                                    LV_PART_MAIN);
+        lv_obj_set_pos(s_ui.market_changes[item_index], 84, 35);
+        lv_obj_set_size(s_ui.market_changes[item_index], 88, 25);
+        lv_obj_set_style_text_align(s_ui.market_changes[item_index],
+                                    LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
 
         lv_obj_t *chart = lv_chart_create(row);
-        s_ui.market_charts[i] = chart;
-        lv_obj_set_pos(chart, 180, 6);
-        lv_obj_set_size(chart, 214, 63);
+        s_ui.market_charts[item_index] = chart;
+        lv_obj_set_pos(chart, 180, 5);
+        lv_obj_set_size(chart, 214, height - 10);
         lv_obj_set_style_bg_color(chart, lv_color_white(), LV_PART_MAIN);
         lv_obj_set_style_bg_opa(chart, LV_OPA_COVER, LV_PART_MAIN);
         lv_obj_set_style_border_width(chart, 0, LV_PART_MAIN);
@@ -307,11 +335,25 @@ void CreateMarketPage()
         lv_chart_set_point_count(chart, APP_MARKET_CHART_POINT_COUNT);
         lv_chart_set_range(chart, LV_CHART_AXIS_PRIMARY_Y, -10, 10);
         lv_chart_set_div_line_count(chart, 3, 0);
-        s_ui.market_series[i] =
+        s_ui.market_series[item_index] =
             lv_chart_add_series(chart, lv_color_black(),
                                 LV_CHART_AXIS_PRIMARY_Y);
-        lv_chart_set_all_value(chart, s_ui.market_series[i],
+        lv_chart_set_all_value(chart, s_ui.market_series[item_index],
                                LV_CHART_POINT_NONE);
+    }
+
+    if (page_index > 0) {
+        char page_marker[8];
+        snprintf(page_marker, sizeof(page_marker), "%u/2",
+                 static_cast<unsigned>(page_index + 1));
+        lv_obj_t *marker =
+            CreateLabel(page, page_marker, &lv_font_noto_sans_sc_13);
+        lv_obj_set_pos(marker, 368, 0);
+        lv_obj_set_size(marker, 30, 17);
+        lv_obj_set_style_bg_color(marker, lv_color_white(), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(marker, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_text_align(marker, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
+        lv_obj_move_foreground(marker);
     }
 }
 
@@ -372,12 +414,13 @@ void CreateSettingsPage()
 
 void RestoreFooterHelp()
 {
-    if (s_current_page == PageId::Market) {
+    if (s_current_page == PageId::Market1 ||
+        s_current_page == PageId::Market2) {
         lv_label_set_text(s_ui.footer,
-                          "BOOT 上一页 | KEY 下一页 | 双击刷新");
+                          "KEY 上一页 | BOOT 下一页 | 双击刷新");
     } else {
         lv_label_set_text(s_ui.footer,
-                          "BOOT 上一页 | KEY 下一页 | 长按操作");
+                          "KEY 上一页 | BOOT 下一页 | 长按操作");
     }
     s_footer_is_message = false;
 }
@@ -399,14 +442,26 @@ void ShowPage(PageId page)
         }
     }
     s_current_page = page;
-    const bool market_fullscreen = page == PageId::Market;
+    const bool market_fullscreen = page == PageId::Market1 ||
+                                   page == PageId::Market2;
+    const bool hide_footer = market_fullscreen || page == PageId::Home;
     if (market_fullscreen) {
         lv_obj_add_flag(s_ui.status_bar, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(s_ui.footer_box, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_clear_flag(s_ui.status_bar, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (hide_footer) {
+        lv_obj_add_flag(s_ui.footer_box, LV_OBJ_FLAG_HIDDEN);
+    } else {
         lv_obj_clear_flag(s_ui.footer_box, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (!market_fullscreen) {
         lv_label_set_text(s_ui.status_title, PageTitle(page));
+    }
+    if (page == PageId::Market1) {
+        AppServices_SetMarketPage(0);
+    } else if (page == PageId::Market2) {
+        AppServices_SetMarketPage(1);
     }
     RestoreFooterHelp();
 }
@@ -431,7 +486,8 @@ void OpenCurrentPage()
         case PageId::Home:
             ShowFooterMessage("首页数据正在实时更新");
             break;
-        case PageId::Market:
+        case PageId::Market1:
+        case PageId::Market2:
             RequestRefresh();
             break;
         case PageId::Settings:
@@ -452,7 +508,7 @@ void HandleButtonEvents(EventBits_t boot_events, EventBits_t key_events)
         ShowPage(PageId::Settings);
         ShowFooterMessage("设备设置");
     } else if (boot_events & kButtonSingle) {
-        MovePage(-1);
+        MovePage(1);
     }
 
     if (key_events & kButtonLong) {
@@ -460,7 +516,7 @@ void HandleButtonEvents(EventBits_t boot_events, EventBits_t key_events)
     } else if (key_events & kButtonDouble) {
         RequestRefresh();
     } else if (key_events & kButtonSingle) {
-        MovePage(1);
+        MovePage(-1);
     }
 }
 
@@ -620,6 +676,14 @@ void UpdateConnectivityLabels()
     }
 
     if (s_market_rendered_generation != services.market_generation) {
+        for (size_t i = 0; i < APP_MARKET_BENCHMARK_COUNT; ++i) {
+            snprintf(buffer, sizeof(buffer), "%s  %s",
+                     i == 0 ? "上证" : "科创",
+                     services.benchmarks[i].valid
+                         ? services.benchmarks[i].amplitude
+                         : "--");
+            lv_label_set_text(s_ui.market_benchmarks[i], buffer);
+        }
         for (size_t i = 0; i < APP_MARKET_ITEM_COUNT; ++i) {
             if (services.market[i].valid) {
                 lv_label_set_text(s_ui.market_names[i],
@@ -636,6 +700,13 @@ void UpdateConnectivityLabels()
                 lv_label_set_text(s_ui.market_changes[i],
                                   services.market[i].change);
                 UpdateMarketChart(i, services.market[i]);
+            } else {
+                lv_label_set_text(s_ui.market_names[i], "待配置");
+                lv_label_set_text(s_ui.market_codes[i], "--");
+                lv_label_set_text(s_ui.market_prices[i], "--");
+                lv_label_set_text(s_ui.market_changes[i], "--");
+                AppMarketItem empty = {};
+                UpdateMarketChart(i, empty);
             }
         }
         s_market_rendered_generation = services.market_generation;
@@ -755,12 +826,13 @@ void UserApp_UiInit()
 
     CreateStatusBar();
     CreateHomePage();
-    CreateMarketPage();
+    CreateMarketPage(PageId::Market1, 0, false);
+    CreateMarketPage(PageId::Market2, 1, true);
     CreateSettingsPage();
     CreateFooter();
     ShowPage(PageId::Home);
 
-    ESP_LOGI(kTag, "Three-page UI initialized");
+    ESP_LOGI(kTag, "Four-page UI initialized");
 }
 
 void UserApp_TaskInit()

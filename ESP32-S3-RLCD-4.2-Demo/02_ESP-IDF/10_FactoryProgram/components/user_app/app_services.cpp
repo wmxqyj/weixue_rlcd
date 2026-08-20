@@ -36,12 +36,12 @@ namespace {
 constexpr EventBits_t kRefreshRequested = (1U << 0);
 constexpr EventBits_t kWebStartRequested = (1U << 1);
 constexpr EventBits_t kWebStopRequested = (1U << 2);
-constexpr TickType_t kWebIdleTimeout = pdMS_TO_TICKS(10 * 60 * 1000);
+constexpr TickType_t kWebIdleTimeout = pdMS_TO_TICKS(3 * 60 * 1000);
 constexpr TickType_t kManualWakeOverride = pdMS_TO_TICKS(30 * 60 * 1000);
 constexpr TickType_t kMarketTradingRefresh = pdMS_TO_TICKS(60 * 1000);
 constexpr TickType_t kMarketIdleRefresh = pdMS_TO_TICKS(15 * 60 * 1000);
 constexpr size_t kHttpResponseCapacity = 24 * 1024;
-constexpr size_t kPostBodyCapacity = 1024;
+constexpr size_t kPostBodyCapacity = 2048;
 
 const char *kTag = "app_services";
 const char *kConfigNamespace = "weixue_app";
@@ -71,10 +71,11 @@ AppConfig s_config = {};
 AppServiceSnapshot s_snapshot = {};
 httpd_handle_t s_http_server = nullptr;
 TickType_t s_web_last_activity = 0;
-bool s_web_desired = true;
+bool s_web_desired = false;
 bool s_sntp_initialized = false;
 bool s_ntp_synced_this_boot = false;
 TickType_t s_schedule_override_until = 0;
+size_t s_active_market_page = 0;
 
 void StopWebServer();
 
@@ -90,6 +91,8 @@ void Unlock()
 
 void SetDefaultConfig()
 {
+    memset(s_config.stocks, 0, sizeof(s_config.stocks));
+    memset(s_config.stock_names, 0, sizeof(s_config.stock_names));
     strlcpy(s_config.stocks[0], "000001.SS", sizeof(s_config.stocks[0]));
     strlcpy(s_config.stocks[1], "000688.SS", sizeof(s_config.stocks[1]));
     strlcpy(s_config.stocks[2], "601899.SS", sizeof(s_config.stocks[2]));
@@ -139,11 +142,19 @@ void LoadConfig()
         for (size_t i = 0; i < APP_MARKET_ITEM_COUNT; ++i) {
             char key[12];
             snprintf(key, sizeof(key), "stock%u", static_cast<unsigned>(i));
-            ReadNvsString(handle, key, s_config.stocks[i],
-                          sizeof(s_config.stocks[i]));
+            if (config_schema >= 6 || i < APP_MARKET_ITEMS_PER_PAGE) {
+                ReadNvsString(handle, key, s_config.stocks[i],
+                              sizeof(s_config.stocks[i]));
+            } else {
+                nvs_set_str(handle, key, s_config.stocks[i]);
+            }
             snprintf(key, sizeof(key), "name%u", static_cast<unsigned>(i));
-            ReadNvsString(handle, key, s_config.stock_names[i],
-                          sizeof(s_config.stock_names[i]));
+            if (config_schema >= 6 || i < APP_MARKET_ITEMS_PER_PAGE) {
+                ReadNvsString(handle, key, s_config.stock_names[i],
+                              sizeof(s_config.stock_names[i]));
+            } else {
+                nvs_set_str(handle, key, s_config.stock_names[i]);
+            }
         }
     }
     uint8_t enabled = s_config.sleep_schedule_enabled ? 1 : 0;
@@ -176,7 +187,7 @@ void LoadConfig()
         nvs_set_u8(handle, "wake_h", s_config.wake_hour);
         nvs_set_u8(handle, "wake_m", s_config.wake_minute);
     }
-    nvs_set_u32(handle, "schema", 5);
+    nvs_set_u32(handle, "schema", 6);
     nvs_commit(handle);
     nvs_close(handle);
     s_snapshot.sleep_schedule_enabled = s_config.sleep_schedule_enabled;
@@ -290,6 +301,13 @@ void LoadMarketCache()
             if (!cJSON_IsObject(item)) {
                 continue;
             }
+            cJSON *slot = cJSON_GetObjectItem(item, "slot");
+            const size_t target = cJSON_IsNumber(slot)
+                                      ? static_cast<size_t>(slot->valueint)
+                                      : i;
+            if (target >= APP_MARKET_ITEM_COUNT) {
+                continue;
+            }
             cJSON *symbol = cJSON_GetObjectItem(item, "symbol");
             cJSON *name = cJSON_GetObjectItem(item, "name");
             cJSON *price = cJSON_GetObjectItem(item, "price");
@@ -298,22 +316,22 @@ void LoadMarketCache()
                 cJSON_GetObjectItem(item, "change_amount");
             if (cJSON_IsString(symbol) && cJSON_IsString(price) &&
                 cJSON_IsString(change)) {
-                strlcpy(s_snapshot.market[i].name,
+                strlcpy(s_snapshot.market[target].name,
                         cJSON_IsString(name) ? name->valuestring
-                                             : s_config.stock_names[i],
-                        sizeof(s_snapshot.market[i].name));
-                strlcpy(s_snapshot.market[i].symbol, symbol->valuestring,
-                        sizeof(s_snapshot.market[i].symbol));
-                strlcpy(s_snapshot.market[i].price, price->valuestring,
-                        sizeof(s_snapshot.market[i].price));
-                strlcpy(s_snapshot.market[i].change, change->valuestring,
-                        sizeof(s_snapshot.market[i].change));
-                strlcpy(s_snapshot.market[i].change_amount,
+                                             : s_config.stock_names[target],
+                        sizeof(s_snapshot.market[target].name));
+                strlcpy(s_snapshot.market[target].symbol, symbol->valuestring,
+                        sizeof(s_snapshot.market[target].symbol));
+                strlcpy(s_snapshot.market[target].price, price->valuestring,
+                        sizeof(s_snapshot.market[target].price));
+                strlcpy(s_snapshot.market[target].change, change->valuestring,
+                        sizeof(s_snapshot.market[target].change));
+                strlcpy(s_snapshot.market[target].change_amount,
                         cJSON_IsString(change_amount)
                             ? change_amount->valuestring
                             : "--",
-                        sizeof(s_snapshot.market[i].change_amount));
-                s_snapshot.market[i].valid = true;
+                        sizeof(s_snapshot.market[target].change_amount));
+                s_snapshot.market[target].valid = true;
             }
         }
         cJSON *updated = cJSON_GetObjectItem(root, "updated");
@@ -333,11 +351,13 @@ void SaveMarketCache()
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "updated", snapshot.last_update);
     cJSON *items = cJSON_AddArrayToObject(root, "items");
-    for (const AppMarketItem &market : snapshot.market) {
+    for (size_t i = 0; i < APP_MARKET_ITEM_COUNT; ++i) {
+        const AppMarketItem &market = snapshot.market[i];
         if (!market.valid) {
             continue;
         }
         cJSON *item = cJSON_CreateObject();
+        cJSON_AddNumberToObject(item, "slot", static_cast<double>(i));
         cJSON_AddStringToObject(item, "name", market.name);
         cJSON_AddStringToObject(item, "symbol", market.symbol);
         cJSON_AddStringToObject(item, "price", market.price);
@@ -523,109 +543,216 @@ bool FetchIntraday(const char *provider_symbol, double previous_close,
     return valid_points > 0;
 }
 
-bool FetchMarketItem(const char *symbol, const char *display_name,
-                     AppMarketItem *output, char *response)
+bool ToProviderSymbol(const char *symbol, char *provider, size_t capacity)
 {
-    if (!IsSafeMarketSymbol(symbol)) {
+    if (!IsSafeMarketSymbol(symbol) || provider == nullptr || capacity < 9) {
         return false;
     }
-    memset(output, 0, sizeof(*output));
-    std::fill(std::begin(output->intraday), std::end(output->intraday),
-              APP_MARKET_POINT_NONE);
-    strlcpy(output->name, display_name, sizeof(output->name));
-    strlcpy(output->symbol, symbol, sizeof(output->symbol));
+    const char *prefix = strcmp(symbol + 6, ".SS") == 0 ? "sh" : "sz";
+    snprintf(provider, capacity, "%s%.6s", prefix, symbol);
+    return true;
+}
 
-    char provider_symbol[32] = {};
-    const size_t length = strlen(symbol);
-    if (length > 3 && strcmp(symbol + length - 3, ".SS") == 0) {
-        snprintf(provider_symbol, sizeof(provider_symbol), "sh%.*s",
-                 static_cast<int>(length - 3), symbol);
-    } else if (length > 3 && strcmp(symbol + length - 3, ".SZ") == 0) {
-        snprintf(provider_symbol, sizeof(provider_symbol), "sz%.*s",
-                 static_cast<int>(length - 3), symbol);
-    } else {
-        return false;
-    }
-    char url[160];
-    snprintf(url, sizeof(url), "https://qt.gtimg.cn/q=%s", provider_symbol);
-    if (!HttpGet(url, response, kHttpResponseCapacity)) {
-        snprintf(url, sizeof(url), "http://qt.gtimg.cn/q=%s", provider_symbol);
-        if (!HttpGet(url, response, kHttpResponseCapacity)) {
-            return false;
-        }
-    }
+struct QuoteValues {
+    double price;
+    double previous_close;
+    double high;
+    double low;
+};
 
-    char *record = strchr(response, '"');
-    if (record == nullptr) {
+bool ParseQuoteValues(const char *response, const char *provider_symbol,
+                      QuoteValues *values)
+{
+    char marker[32];
+    snprintf(marker, sizeof(marker), "v_%s=\"", provider_symbol);
+    const char *start = strstr(response, marker);
+    if (start == nullptr) {
         return false;
     }
-    ++record;
+    start += strlen(marker);
+    const char *end = strchr(start, '"');
+    if (end == nullptr || end <= start) {
+        return false;
+    }
+    char record[1024];
+    const size_t length = std::min(static_cast<size_t>(end - start),
+                                   sizeof(record) - 1);
+    memcpy(record, start, length);
+    record[length] = '\0';
+
+    QuoteValues parsed = {};
     char *save = nullptr;
     char *field = strtok_r(record, "~", &save);
-    int index = 0;
-    const char *price_text = nullptr;
-    const char *previous_close_text = nullptr;
-    while (field != nullptr) {
+    for (int index = 0; field != nullptr; ++index) {
         if (index == 3) {
-            price_text = field;
+            parsed.price = strtod(field, nullptr);
         } else if (index == 4) {
-            previous_close_text = field;
-        }
-        if (price_text != nullptr && previous_close_text != nullptr) {
+            parsed.previous_close = strtod(field, nullptr);
+        } else if (index == 33) {
+            parsed.high = strtod(field, nullptr);
+        } else if (index == 34) {
+            parsed.low = strtod(field, nullptr);
             break;
         }
         field = strtok_r(nullptr, "~", &save);
-        ++index;
     }
-    if (price_text == nullptr || previous_close_text == nullptr ||
-        price_text[0] == '\0' || previous_close_text[0] == '\0') {
+    if (parsed.price <= 0.0 || parsed.previous_close <= 0.0) {
         return false;
     }
-    const double value = strtod(price_text, nullptr);
-    const double previous_close = strtod(previous_close_text, nullptr);
-    if (value <= 0.0 || previous_close <= 0.0) {
-        return false;
-    }
-    const double change_amount = value - previous_close;
-    const double change_percent = change_amount / previous_close * 100.0;
+    *values = parsed;
+    return true;
+}
+
+void ApplyQuote(const QuoteValues &quote, AppMarketItem *output)
+{
+    const double change_amount = quote.price - quote.previous_close;
+    const double change_percent =
+        change_amount / quote.previous_close * 100.0;
     snprintf(output->price, sizeof(output->price),
-             value >= 10000.0 ? "%.0f" : "%.2f", value);
+             quote.price >= 10000.0 ? "%.0f" : "%.2f", quote.price);
     snprintf(output->change, sizeof(output->change), "%+.2f%%",
              change_percent);
     snprintf(output->change_amount, sizeof(output->change_amount), "%+.2f",
              change_amount);
-    if (!FetchIntraday(provider_symbol, previous_close, output, response)) {
-        ESP_LOGW(kTag, "Intraday unavailable for %s", provider_symbol);
-    }
     output->valid = true;
+}
+
+bool AppendProvider(char providers[][12], size_t *count,
+                    const char *symbol)
+{
+    char provider[12];
+    if (!ToProviderSymbol(symbol, provider, sizeof(provider))) {
+        return false;
+    }
+    for (size_t i = 0; i < *count; ++i) {
+        if (strcmp(providers[i], provider) == 0) {
+            return true;
+        }
+    }
+    strlcpy(providers[*count], provider, sizeof(providers[*count]));
+    ++(*count);
     return true;
 }
 
 bool FetchMarketData(char *response)
 {
+    static const char *const kBenchmarkNames[APP_MARKET_BENCHMARK_COUNT] = {
+        "上证", "科创"
+    };
+    static const char *const kBenchmarkSymbols[APP_MARKET_BENCHMARK_COUNT] = {
+        "000001.SS", "000688.SS"
+    };
+
     AppConfig config;
+    AppMarketItem fetched[APP_MARKET_ITEM_COUNT] = {};
+    size_t active_page;
     Lock();
     config = s_config;
+    memcpy(fetched, s_snapshot.market, sizeof(fetched));
+    active_page = s_active_market_page;
     Unlock();
 
-    AppMarketItem fetched[APP_MARKET_ITEM_COUNT] = {};
+    char providers[APP_MARKET_ITEM_COUNT + APP_MARKET_BENCHMARK_COUNT][12] = {};
+    size_t provider_count = 0;
+    for (const char *symbol : kBenchmarkSymbols) {
+        AppendProvider(providers, &provider_count, symbol);
+    }
+    for (size_t i = 0; i < APP_MARKET_ITEM_COUNT; ++i) {
+        if (strcmp(fetched[i].symbol, config.stocks[i]) != 0) {
+            memset(&fetched[i], 0, sizeof(fetched[i]));
+            std::fill(std::begin(fetched[i].intraday),
+                      std::end(fetched[i].intraday), APP_MARKET_POINT_NONE);
+        }
+        strlcpy(fetched[i].name, config.stock_names[i], sizeof(fetched[i].name));
+        strlcpy(fetched[i].symbol, config.stocks[i], sizeof(fetched[i].symbol));
+        if (config.stocks[i][0] != '\0') {
+            AppendProvider(providers, &provider_count, config.stocks[i]);
+        } else {
+            fetched[i].valid = false;
+        }
+    }
+
+    char url[512] = "https://qt.gtimg.cn/q=";
+    for (size_t i = 0; i < provider_count; ++i) {
+        if (i > 0) {
+            strlcat(url, ",", sizeof(url));
+        }
+        strlcat(url, providers[i], sizeof(url));
+    }
+    if (!HttpGet(url, response, kHttpResponseCapacity)) {
+        memmove(url + 4, url + 5, strlen(url + 5) + 1);
+        if (!HttpGet(url, response, kHttpResponseCapacity)) {
+            return false;
+        }
+    }
+
+    double previous_close[APP_MARKET_ITEM_COUNT] = {};
     bool any_success = false;
     for (size_t i = 0; i < APP_MARKET_ITEM_COUNT; ++i) {
-        if (FetchMarketItem(config.stocks[i], config.stock_names[i],
-                            &fetched[i], response)) {
+        char provider[12];
+        QuoteValues quote = {};
+        if (!ToProviderSymbol(config.stocks[i], provider, sizeof(provider)) ||
+            !ParseQuoteValues(response, provider, &quote)) {
+            continue;
+        }
+        ApplyQuote(quote, &fetched[i]);
+        previous_close[i] = quote.previous_close;
+        any_success = true;
+    }
+
+    AppMarketBenchmark benchmarks[APP_MARKET_BENCHMARK_COUNT] = {};
+    for (size_t i = 0; i < APP_MARKET_BENCHMARK_COUNT; ++i) {
+        char provider[12];
+        QuoteValues quote = {};
+        strlcpy(benchmarks[i].name, kBenchmarkNames[i],
+                sizeof(benchmarks[i].name));
+        strlcpy(benchmarks[i].symbol, kBenchmarkSymbols[i],
+                sizeof(benchmarks[i].symbol));
+        if (ToProviderSymbol(kBenchmarkSymbols[i], provider, sizeof(provider)) &&
+            ParseQuoteValues(response, provider, &quote) && quote.high > 0.0 &&
+            quote.low > 0.0) {
+            const double amplitude =
+                (quote.high - quote.low) / quote.previous_close * 100.0;
+            snprintf(benchmarks[i].amplitude,
+                     sizeof(benchmarks[i].amplitude), "%.2f%%", amplitude);
+            benchmarks[i].valid = true;
             any_success = true;
         }
     }
+
+    const size_t first = active_page * APP_MARKET_ITEMS_PER_PAGE;
+    const size_t last = std::min(first + APP_MARKET_ITEMS_PER_PAGE,
+                                 APP_MARKET_ITEM_COUNT);
+    for (size_t i = first; i < last; ++i) {
+        if (!fetched[i].valid || previous_close[i] <= 0.0) {
+            continue;
+        }
+        char provider[12];
+        if (!ToProviderSymbol(fetched[i].symbol, provider, sizeof(provider))) {
+            continue;
+        }
+        AppMarketItem with_chart = fetched[i];
+        std::fill(std::begin(with_chart.intraday),
+                  std::end(with_chart.intraday), APP_MARKET_POINT_NONE);
+        with_chart.intraday_points = 0;
+        if (FetchIntraday(provider, previous_close[i], &with_chart, response)) {
+            fetched[i] = with_chart;
+        } else {
+            ESP_LOGW(kTag, "Intraday unavailable for %s", provider);
+        }
+    }
+
     if (any_success) {
         Lock();
-        for (size_t i = 0; i < APP_MARKET_ITEM_COUNT; ++i) {
-            if (fetched[i].valid) {
-                s_snapshot.market[i] = fetched[i];
-            }
-        }
+        memcpy(s_snapshot.market, fetched, sizeof(fetched));
+        memcpy(s_snapshot.benchmarks, benchmarks, sizeof(benchmarks));
         ++s_snapshot.market_generation;
         Unlock();
     }
+    ESP_LOGI(kTag, "Market batch updated: page=%u quotes=%u charts=%u",
+             static_cast<unsigned>(active_page + 1),
+             static_cast<unsigned>(provider_count),
+             static_cast<unsigned>(last - first));
     return any_success;
 }
 
@@ -755,6 +882,7 @@ bool ScheduledSleepDue(uint64_t *seconds_until_wake)
 
     // Give LVGL enough time to render the sleep status before suspending CPUs.
     vTaskDelay(pdMS_TO_TICKS(2000));
+    espwifi_deinit();
     ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(seconds_until_wake * 1000000ULL));
     ESP_ERROR_CHECK(esp_sleep_enable_ext0_wakeup(GPIO_NUM_18, 0));
     esp_deep_sleep_start();
@@ -869,11 +997,11 @@ esp_err_t IndexHandler(httpd_req_t *request)
 <title>微雪墨水屏配置</title><style>
 body{font-family:system-ui,sans-serif;max-width:760px;margin:20px auto;padding:0 16px;background:#f3f5f7;color:#18212b}h1{font-size:24px}section{background:#fff;border-radius:12px;padding:16px;margin:12px 0;box-shadow:0 1px 5px #0002}label{display:block;margin:10px 0 4px}input{box-sizing:border-box;width:100%;padding:10px;border:1px solid #aeb8c2;border-radius:7px}button{padding:10px 16px;margin:10px 8px 0 0;border:0;border-radius:7px;background:#1769aa;color:#fff}.danger{background:#a33}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}.muted{color:#647383;font-size:14px}pre{white-space:pre-wrap}</style></head>
 <body><h1>ESP32-S3 RLCD 配置</h1><section><h2>设备状态</h2><div id="status">读取中…</div></section>
-<section><h2>网络、A股与休眠</h2><form id="config"><label>Wi-Fi 名称</label><input id="ssid" maxlength="32"><label>新密码（留空表示不修改）</label><input id="password" type="password" maxlength="63"><div class="grid"><div><label>股票1名称</label><input id="name0" maxlength="20"><label>股票1代码</label><input id="stock0" maxlength="9"></div><div><label>股票2名称</label><input id="name1" maxlength="20"><label>股票2代码</label><input id="stock1" maxlength="9"></div><div><label>股票3名称</label><input id="name2" maxlength="20"><label>股票3代码</label><input id="stock2" maxlength="9"></div><div><label>股票4名称</label><input id="name3" maxlength="20"><label>股票4代码</label><input id="stock3" maxlength="9"></div></div><label><input id="sleepEnabled" type="checkbox" style="width:auto"> 启用每日深度休眠</label><div class="grid"><div><label>休眠时间</label><input id="sleepTime" type="time"></div><div><label>唤醒时间</label><input id="wakeTime" type="time"></div></div><p class="muted">A 股在交易时段每 1 分钟刷新，非交易时段降低频率。蓝牙已关闭。</p><p class="muted">默认每天 22:00 休眠、次日 08:30 唤醒；按 KEY 可临时唤醒 30 分钟。仅接受六位 A 股代码：沪市使用 .SS，深市使用 .SZ。</p><button type="submit">保存并应用</button></form><button id="refreshNow">立即刷新</button><button class="danger" id="stopWeb">关闭配置网页</button><pre id="message"></pre></section>
+<section><h2>网络、A股与休眠</h2><form id="config"><label>Wi-Fi 名称</label><input id="ssid" maxlength="32"><label>新密码（留空表示不修改）</label><input id="password" type="password" maxlength="63"><h3>股票第一页</h3><div class="grid"><div><label>股票1名称</label><input id="name0" maxlength="20"><label>股票1代码</label><input id="stock0" maxlength="9"></div><div><label>股票2名称</label><input id="name1" maxlength="20"><label>股票2代码</label><input id="stock1" maxlength="9"></div><div><label>股票3名称</label><input id="name2" maxlength="20"><label>股票3代码</label><input id="stock2" maxlength="9"></div><div><label>股票4名称</label><input id="name3" maxlength="20"><label>股票4代码</label><input id="stock3" maxlength="9"></div></div><h3>股票第二页</h3><p class="muted">第二页顶部固定显示上证和科创振幅；以下四项可留空。</p><div class="grid"><div><label>股票5名称</label><input id="name4" maxlength="20"><label>股票5代码</label><input id="stock4" maxlength="9"></div><div><label>股票6名称</label><input id="name5" maxlength="20"><label>股票6代码</label><input id="stock5" maxlength="9"></div><div><label>股票7名称</label><input id="name6" maxlength="20"><label>股票7代码</label><input id="stock6" maxlength="9"></div><div><label>股票8名称</label><input id="name7" maxlength="20"><label>股票8代码</label><input id="stock7" maxlength="9"></div></div><label><input id="sleepEnabled" type="checkbox" style="width:auto"> 启用每日深度休眠</label><div class="grid"><div><label>休眠时间</label><input id="sleepTime" type="time"></div><div><label>唤醒时间</label><input id="wakeTime" type="time"></div></div><p class="muted">A 股交易时段每 1 分钟批量更新报价，只刷新当前页分时图。蓝牙已关闭。</p><p class="muted">默认每天 22:00 休眠、次日 08:30 唤醒；按 KEY 可临时唤醒 30 分钟。仅接受六位 A 股代码：沪市使用 .SS，深市使用 .SZ。</p><button type="submit">保存并应用</button></form><button id="refreshNow">立即刷新</button><button class="danger" id="stopWeb">关闭配置网页</button><pre id="message"></pre></section>
 <script>
-const $=id=>document.getElementById(id);async function getJson(url,opt){const r=await fetch(url,opt);if(!r.ok)throw new Error(await r.text());return r.json()}
-async function load(){try{const [s,c]=await Promise.all([getJson('/api/status'),getJson('/api/config')]);$('status').innerHTML=`无线网络：${s.wifi_connected?'已连接':'未连接'} ${s.ip||''}<br>蓝牙：已关闭<br>存储卡：${s.sd_ready?'正常，可用 '+s.sd_free_mb+' MB':'不可用'}<br>时间同步：${s.time_synced?'完成':'等待中'}<br>休眠计划：${c.sleep_schedule_enabled?c.sleep_time+' → '+c.wake_time:'关闭'}<br>数据更新：${s.last_update||'暂无'}<br>网页将在空闲 10 分钟后自动关闭`;$('ssid').value=c.ssid;for(let i=0;i<4;i++){$('stock'+i).value=c.stocks[i];$('name'+i).value=c.stock_names[i]}$('sleepEnabled').checked=c.sleep_schedule_enabled;$('sleepTime').value=c.sleep_time;$('wakeTime').value=c.wake_time}catch(e){$('message').textContent=e}}
-$('config').onsubmit=async e=>{e.preventDefault();const st=$('sleepTime').value.split(':').map(Number),wt=$('wakeTime').value.split(':').map(Number);const body={ssid:$('ssid').value,password:$('password').value,stocks:[$('stock0').value,$('stock1').value,$('stock2').value,$('stock3').value],stock_names:[$('name0').value,$('name1').value,$('name2').value,$('name3').value],sleep_schedule_enabled:$('sleepEnabled').checked,sleep_hour:st[0],sleep_minute:st[1],wake_hour:wt[0],wake_minute:wt[1]};try{await getJson('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});$('password').value='';$('message').textContent='保存成功，已请求刷新。修改 Wi-Fi 后本页面可能暂时断开。';setTimeout(load,1500)}catch(e){$('message').textContent=e}};
+const $=id=>document.getElementById(id);let formDirty=false;async function getJson(url,opt){const r=await fetch(url,opt);if(!r.ok)throw new Error(await r.text());return r.json()}
+async function load(){try{const [s,c]=await Promise.all([getJson('/api/status'),getJson('/api/config')]);$('status').innerHTML=`无线网络：${s.wifi_connected?'已连接':'未连接'} ${s.ip||''}<br>蓝牙：已关闭<br>存储卡：${s.sd_ready?'正常，可用 '+s.sd_free_mb+' MB':'不可用'}<br>时间同步：${s.time_synced?'完成':'等待中'}<br>休眠计划：${c.sleep_schedule_enabled?c.sleep_time+' → '+c.wake_time:'关闭'}<br>数据更新：${s.last_update||'暂无'}<br>网页将在空闲 3 分钟后自动关闭`;if(!formDirty){$('ssid').value=c.ssid;for(let i=0;i<8;i++){$('stock'+i).value=c.stocks[i];$('name'+i).value=c.stock_names[i]}$('sleepEnabled').checked=c.sleep_schedule_enabled;$('sleepTime').value=c.sleep_time;$('wakeTime').value=c.wake_time}}catch(e){$('message').textContent=e}}
+$('config').addEventListener('input',()=>{formDirty=true});$('config').onsubmit=async e=>{e.preventDefault();const st=$('sleepTime').value.split(':').map(Number),wt=$('wakeTime').value.split(':').map(Number);const body={ssid:$('ssid').value,password:$('password').value,stocks:Array.from({length:8},(_,i)=>$('stock'+i).value),stock_names:Array.from({length:8},(_,i)=>$('name'+i).value),sleep_schedule_enabled:$('sleepEnabled').checked,sleep_hour:st[0],sleep_minute:st[1],wake_hour:wt[0],wake_minute:wt[1]};try{await getJson('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});formDirty=false;$('password').value='';$('message').textContent='保存成功，已请求刷新。修改 Wi-Fi 后本页面可能暂时断开。';setTimeout(load,1500)}catch(e){$('message').textContent=e}};
 $('refreshNow').onclick=async()=>{await getJson('/api/refresh',{method:'POST'});$('message').textContent='已请求立即刷新。'};$('stopWeb').onclick=async()=>{await getJson('/api/stop',{method:'POST'});$('message').textContent='网页服务正在关闭，可通过设备设置页长按 KEY 再次开启。'};load();setInterval(load,10000);
 </script></body></html>)HTML";
     httpd_resp_set_type(request, "text/html; charset=utf-8");
@@ -997,10 +1125,17 @@ esp_err_t ConfigPostHandler(httpd_req_t *request)
             cJSON *symbol = cJSON_GetArrayItem(stocks, static_cast<int>(i));
             cJSON *name =
                 cJSON_GetArrayItem(stock_names, static_cast<int>(i));
-            if (!cJSON_IsString(symbol) ||
-                !IsSafeMarketSymbol(symbol->valuestring) ||
-                !cJSON_IsString(name) || name->valuestring[0] == '\0' ||
-                strlen(name->valuestring) >= sizeof(new_config.stock_names[i])) {
+            if (!cJSON_IsString(symbol) || !cJSON_IsString(name)) {
+                valid = false;
+                break;
+            }
+            const bool empty_pair = symbol->valuestring[0] == '\0' &&
+                                    name->valuestring[0] == '\0';
+            const bool configured = IsSafeMarketSymbol(symbol->valuestring) &&
+                                    name->valuestring[0] != '\0' &&
+                                    strlen(name->valuestring) <
+                                        sizeof(new_config.stock_names[i]);
+            if (!empty_pair && !configured) {
                 valid = false;
                 break;
             }
@@ -1208,7 +1343,7 @@ void AppServices_Start()
 {
     xTaskCreatePinnedToCore(ServiceTask, "app_services", 10240, nullptr, 3,
                             nullptr, 1);
-    xEventGroupSetBits(s_events, kWebStartRequested | kRefreshRequested);
+    xEventGroupSetBits(s_events, kRefreshRequested);
 }
 
 void AppServices_GetSnapshot(AppServiceSnapshot *snapshot)
@@ -1225,6 +1360,22 @@ void AppServices_RequestRefresh()
 {
     if (s_events != nullptr) {
         xEventGroupSetBits(s_events, kRefreshRequested);
+    }
+}
+
+void AppServices_SetMarketPage(size_t page)
+{
+    if (page >= APP_MARKET_PAGE_COUNT || s_mutex == nullptr) {
+        return;
+    }
+    Lock();
+    const bool changed = s_active_market_page != page;
+    s_active_market_page = page;
+    Unlock();
+    if (changed) {
+        ESP_LOGI(kTag, "Active market page changed to %u",
+                 static_cast<unsigned>(page + 1));
+        AppServices_RequestRefresh();
     }
 }
 

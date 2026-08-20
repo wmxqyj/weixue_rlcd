@@ -10,7 +10,7 @@
 #include <string.h>
 
 // Configuration constants - can be modified according to your needs
-#define TICKS_INTERVAL          5    // ms - timer interrupt interval
+#define TICKS_INTERVAL          20   // ms - timer interrupt interval
 #define DEBOUNCE_TICKS          3    // MAX 7 (0 ~ 7) - debounce filter depth
 #define SHORT_TICKS             (300 / TICKS_INTERVAL)   // short press threshold
 #define LONG_TICKS              (1000 / TICKS_INTERVAL)  // long press threshold

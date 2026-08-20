@@ -93,7 +93,8 @@ void Custom_ButtonInit(void) {
     clock_tick_timer_args.arg                     = NULL;
     esp_timer_handle_t clock_tick_timer           = NULL;
     ESP_ERROR_CHECK(esp_timer_create(&clock_tick_timer_args, &clock_tick_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(clock_tick_timer, 1000 * 5)); // 5ms
+    ESP_ERROR_CHECK(esp_timer_start_periodic(
+        clock_tick_timer, 1000 * TICKS_INTERVAL));
     button_start(&BootButton);
     button_start(&GP18Button);
 }
